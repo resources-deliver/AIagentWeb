@@ -12,6 +12,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import edge_tts
 import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
+# 导入功能模块
+from time_query.time_query import get_current_time
+from weather_query.weather_query import get_weather
+from voice_feature.voice_feature import synthesize_speech
+from stock_query.stock_query import get_stock_price_cn
+from mail_utils.email_tool import send_email
 
 BASE_DIR = Path(__file__).resolve().parent
 PUBLIC_DIR = BASE_DIR / "public"
@@ -111,6 +117,43 @@ TOOLS: List[Dict[str, Any]] = [
                 "required": ["city"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_stock_price_cn",
+            "description": "查询中国A股市场实时股价。输入6位股票代码，如600519。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticker": {
+                        "type": "string",
+                        "description": "6位股票代码，如600519"
+                    }
+                },
+                "required": ["ticker"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email",
+            "description": "发送邮件。需提供SMTP服务器、端口、发件人账号、密码、收件人、主题、内容。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "smtp_server": {"type": "string", "description": "SMTP服务器地址"},
+                    "smtp_port": {"type": "integer", "description": "SMTP端口，通常为465或587"},
+                    "username": {"type": "string", "description": "发件人邮箱账号"},
+                    "password": {"type": "string", "description": "发件人邮箱密码/授权码"},
+                    "to_addr": {"type": "string", "description": "收件人邮箱"},
+                    "subject": {"type": "string", "description": "邮件主题"},
+                    "content": {"type": "string", "description": "邮件正文"}
+                },
+                "required": ["smtp_server", "smtp_port", "username", "password", "to_addr", "subject", "content"],
+            },
+        },
     }
 ]
 
@@ -125,6 +168,14 @@ TOOLS_DESCRIPTION = """
    - city: 城市名称（如"广州"、"北京"、"上海"等）
    - 当用户询问"广州今天天气如何"、"北京今天多少度"、"上海天气怎么样"等问题时，请调用此工具
 
+3. get_stock_price_cn(ticker) - 查询中国A股市场实时股价
+   - ticker: 6位股票代码（如"600519"）
+   - 当用户询问"贵州茅台股价多少"、"600519现在多少钱"等问题时，请调用此工具
+
+4. send_email(...) - 发送邮件
+   - 需提供SMTP服务器、端口、发件人账号、密码、收件人、主题、内容
+   - 当用户要求"帮我发邮件"时，请调用此工具
+
 重要：当你需要使用工具时，请在思考过程中调用工具，然后基于工具返回的结果给用户一个自然、流畅的回答。
 不要直接把工具调用的格式（如 JSON）展示给用户，而是要将工具的结果转化为你自己的话术来回答。
 
@@ -134,6 +185,15 @@ TOOLS_DESCRIPTION = """
   
 - 用户问："广州天气怎么样？"
   你应该：调用 get_weather 工具获取天气信息，然后回答"广州今天多云，气温 19 到 27 度，北风 2 级，空气质量优。"
+  
+- 用户问："000001.SZ今天股价如何？"
+  你应该：调用 get_stock_price_cn 工具获取股价信息，然后回答"000001.SZ 当前价 10.5 元，开盘 10.3，昨收 10.2，最高 10.8，最低 10.1。"
+  
+- 用户问："发送邮件"
+  你应该：调用 send_email 工具发送邮件，然后回答"邮件已发送"
+  
+- 用户问："发送邮件"
+  你应该：调用 send_email 工具发送邮件，然后回答"邮件已发送"
 """
 
 app = Flask(__name__, static_folder=None)
@@ -143,274 +203,34 @@ TTS_STATUS_TTL_SECONDS = 300
 
 def strip_think_tags(text: str) -> str:
     return re.sub(
-        r"<think>[\s\S]*?</think>", "", str(text or ""), flags=re.IGNORECASE
+        r"꽁[\s\S]*?꽁", "", str(text or ""), flags=re.IGNORECASE
     ).strip()
 
-
-def get_current_time(query_type: str) -> Dict[str, str]:
-    """获取当前时间信息"""
-    now = datetime.now()
-    
-    if query_type == "time":
-        return {
-            "time": now.strftime("%H:%M:%S"),
-            "response": f"现在的时间是 {now.strftime('%H 点 %M 分 %S 秒')}。",
-        }
-    elif query_type == "date":
-        return {
-            "date": now.strftime("%Y-%m-%d"),
-            "response": f"今天的日期是 {now.strftime('%Y 年 %m 月 %d 日')}。",
-        }
-    elif query_type == "weekday":
-        weekday_map = {
-            0: "星期一",
-            1: "星期二",
-            2: "星期三",
-            3: "星期四",
-            4: "星期五",
-            5: "星期六",
-            6: "星期日",
-        }
-        weekday = weekday_map[now.weekday()]
-        return {
-            "weekday": weekday,
-            "response": f"今天是{weekday}。",
-        }
-    else:  # full
-        weekday_map = {
-            0: "星期一",
-            1: "星期二",
-            2: "星期三",
-            3: "星期四",
-            4: "星期五",
-            5: "星期六",
-            6: "星期日",
-        }
-        weekday = weekday_map[now.weekday()]
-        return {
-            "time": now.strftime("%H:%M:%S"),
-            "date": now.strftime("%Y-%m-%d"),
-            "weekday": weekday,
-            "response": f"现在是 {now.strftime('%Y 年 %m 月 %d 日')} {weekday} {now.strftime('%H 点 %M 分')}",
-        }
-
-
-CITY_CODES: Dict[str, str] = {
-    "北京": "101010100",
-    "北京市": "101010100",
-    "广州": "101280101",
-    "广州市": "101280101",
-    "上海": "101020100",
-    "上海市": "101020100",
-    "深圳": "101280601",
-    "深圳市": "101280601",
-    "杭州": "101210101",
-    "杭州市": "101210101",
-    "南京": "101190101",
-    "南京市": "101190101",
-    "成都": "101270101",
-    "成都市": "101270101",
-    "武汉": "101200101",
-    "武汉市": "101200101",
-    "西安": "101110101",
-    "西安市": "101110101",
-    "重庆": "101040100",
-    "重庆市": "101040100",
-    "天津": "101030100",
-    "天津市": "101030100",
-    "苏州": "101190501",
-    "苏州市": "101190501",
-    "郑州": "101180101",
-    "郑州市": "101180101",
-    "长沙": "101250101",
-    "长沙市": "101250101",
-    "厦门": "101230201",
-    "厦门市": "101230201",
-    "青岛": "101120201",
-    "青岛市": "101120201",
-    "大连": "101070201",
-    "大连市": "101070201",
-    "沈阳": "101070101",
-    "沈阳市": "101070101",
-    "哈尔滨": "101050101",
-    "哈尔滨市": "101050101",
-    "长春": "101060101",
-    "长春市": "101060101",
-    "济南": "101120101",
-    "济南市": "101120101",
-    "合肥": "101220101",
-    "合肥市": "101220101",
-    "福州": "101220201",
-    "福州市": "101220201",
-    "南昌": "101240101",
-    "南昌市": "101240101",
-    "南宁": "101300101",
-    "南宁市": "101300101",
-    "贵阳": "101260101",
-    "贵阳市": "101260101",
-    "昆明": "101290101",
-    "昆明市": "101290101",
-    "拉萨": "101281401",
-    "拉萨市": "101281401",
-    "太原": "101100101",
-    "太原市": "101100101",
-    "石家庄": "101090101",
-    "石家庄市": "101090101",
-    "呼和浩特": "101080101",
-    "呼和浩特市": "101080101",
-    "银川": "101150101",
-    "银川市": "101150101",
-    "西宁": "101150201",
-    "西宁市": "101150201",
-    "乌鲁木齐": "101130101",
-    "乌鲁木齐市": "101130101",
-    "海口": "101310101",
-    "海口市": "101310101",
-    "三亚": "101310201",
-    "三亚市": "101310201",
-}
-
-
-def get_city_code(city_name: str) -> Optional[str]:
-    """获取城市代码"""
-    city_name = city_name.strip()
-    if city_name in CITY_CODES:
-        return CITY_CODES[city_name]
-    
-    for city, code in CITY_CODES.items():
-        if city_name in city or city in city_name:
-            return code
-    
-    return None
-
-
-def get_weather(city: str) -> Dict[str, Any]:
-    """获取指定城市的天气信息"""
-    city_code = get_city_code(city)
-    if not city_code:
-        return {
-            "success": False,
-            "response": f"抱歉，暂时无法查询'{city}'的天气信息，请尝试其他城市。",
-        }
-    
-    try:
-        url = f"http://t.weather.sojson.com/api/weather/city/{city_code}"
-        response = requests.get(url, timeout=10)
-        
-        if not response.ok or response.status_code != 200:
-            return {
-                "success": False,
-                "response": f"抱歉，获取{city}天气信息失败。",
-            }
-        
-        data = response.json()
-        
-        if data.get("status") != 200:
-            return {
-                "success": False,
-                "response": f"抱歉，获取{city}天气信息失败。",
-            }
-        
-        city_info = data.get("cityInfo", {})
-        weather_data = data.get("data", {})
-        forecast = weather_data.get("forecast", [])
-        
-        if not forecast:
-            return {
-                "success": False,
-                "response": f"抱歉，{city}的天气数据暂时不可用。",
-            }
-        
-        today = forecast[0]
-        
-        city_name = city_info.get("city", city)
-        weather_type = today.get("type", "未知")
-        high_temp = today.get("high", "").replace("高温 ", "").replace("℃", "")
-        low_temp = today.get("low", "").replace("低温 ", "").replace("℃", "")
-        wind_dir = today.get("fx", "未知")
-        wind_level = today.get("fl", "未知")
-        humidity = weather_data.get("shidu", "未知")
-        air_quality = weather_data.get("quality", "未知")
-        pm25 = weather_data.get("pm25", "未知")
-        notice = today.get("notice", "")
-        
-        response_text = (
-            f"{city_name}今天{weather_type}，"
-            f"气温{low_temp}~{high_temp}℃，"
-            f"{wind_dir}{wind_level}，"
-            f"湿度{humidity}，"
-            f"空气质量{air_quality}"
-        )
-        
-        if pm25 != "未知":
-            response_text += f"，PM2.5 指数{pm25}"
-        
-        if notice:
-            response_text += f"。{notice}"
-        else:
-            response_text += "。"
-        
-        return {
-            "success": True,
-            "city": city_name,
-            "weather_type": weather_type,
-            "high_temp": high_temp,
-            "low_temp": low_temp,
-            "wind_dir": wind_dir,
-            "wind_level": wind_level,
-            "humidity": humidity,
-            "air_quality": air_quality,
-            "pm25": pm25,
-            "response": response_text,
-        }
-        
-    except requests.RequestException:
-        app.logger.exception("Failed to fetch weather for %s", city)
-        return {
-            "success": False,
-            "response": f"抱歉，网络异常，无法获取{city}的天气信息。",
-        }
-    except Exception:
-        app.logger.exception("Unexpected error fetching weather for %s", city)
-        return {
-            "success": False,
-            "response": f"抱歉，查询{city}天气时发生错误。",
-        }
-
-
+# 修复：将parse_tool_call提前到此处
 def parse_tool_call(think_content: str) -> Optional[Dict[str, Any]]:
-    """解析 <think> 标签中的工具调用"""
+    """解析 꽁 标签中的工具调用"""
     if not think_content:
         return None
-        
-    match = re.search(r"<think>\s*({[\s\S]*?})\s*</think>", think_content, re.IGNORECASE)
+    import re, json
+    match = re.search(r"꽁\s*({[\s\S]*?})\s*꽁", think_content, re.IGNORECASE)
     if not match:
-        # 尝试直接匹配 JSON 格式
         match = re.search(r"{\s*\"name\"\s*:\s*\"(\w+)\"[\s\S]*?}", think_content)
         if not match:
             return None
-    
     try:
-        # 如果是第一种匹配方式，提取 JSON 部分
         if match.group(1):
             tool_data = json.loads(match.group(1))
         else:
             tool_data = json.loads(match.group(0))
-        
-        tool_name = tool_data.get("name")
-        if tool_name in ["get_current_time", "get_weather"]:
-            return tool_data
-    except json.JSONDecodeError:
+        return tool_data
+    except Exception:
         return None
-    
-    return None
 
 
 def execute_tool(tool_data: Dict[str, Any]) -> Optional[str]:
     """执行工具调用并返回结果"""
     tool_name = tool_data.get("name")
     arguments = tool_data.get("arguments", {})
-    
     if tool_name == "get_current_time":
         query_type = arguments.get("query_type", "full")
         result = get_current_time(query_type)
@@ -421,7 +241,27 @@ def execute_tool(tool_data: Dict[str, Any]) -> Optional[str]:
             return "抱歉，请提供要查询的城市名称。"
         result = get_weather(city)
         return result.get("response")
-    
+    elif tool_name == "get_stock_price_cn":
+        ticker = arguments.get("ticker", "")
+        if not ticker:
+            return "抱歉，请提供要查询的股票代码。"
+        result = get_stock_price_cn(ticker)
+        if result.get("status") == "ok":
+            return f"{result['name']}({result['ticker']}): 当前价 {result['current_price']} 元，开盘 {result['open']}，昨收 {result['last_close']}，最高 {result['high']}，最低 {result['low']}。"
+        else:
+            return result.get("message", "查询失败")
+    elif tool_name == "send_email":
+        smtp_server = arguments.get("smtp_server", "")
+        smtp_port = arguments.get("smtp_port", 465)
+        username = arguments.get("username", "")
+        password = arguments.get("password", "")
+        to_addr = arguments.get("to_addr", "")
+        subject = arguments.get("subject", "")
+        content = arguments.get("content", "")
+        if not (smtp_server and username and password and to_addr and subject and content):
+            return "请完整提供SMTP服务器、账号、密码、收件人、主题和内容。"
+        result = send_email(smtp_server, smtp_port, username, password, to_addr, subject, content)
+        return result.get("message")
     return None
 
 
